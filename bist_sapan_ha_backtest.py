@@ -248,6 +248,157 @@ def ha_skor_hesapla(ha, idx):
     ha_sinyal_var = skor >= 55
     return skor, " | ".join(detay) if detay else "—", ha_sinyal_var
 
+# ─── YENİ HA SKORU: "DÖNÜŞ TAZELİĞİ" (A + B birleşimi) ──────────────────────
+def _ha_govde_fitil(mum):
+    """Tek bir HA mumu için gövde, alt fitil, üst fitil döndürür."""
+    govde = abs(mum["HA_Close"] - mum["HA_Open"])
+    alt   = abs(min(mum["HA_Open"], mum["HA_Close"]) - mum["HA_Low"])
+    ust   = abs(mum["HA_High"] - max(mum["HA_Open"], mum["HA_Close"]))
+    return govde, alt, ust
+
+def _ha_yesil(mum):
+    return mum["HA_Close"] > mum["HA_Open"]
+
+def _ha_kirmizi(mum):
+    return mum["HA_Close"] < mum["HA_Open"]
+
+def _ha_doji(mum):
+    """ha_tarayici.py'deki doji tanımı ile aynı mantık."""
+    govde, alt, ust = _ha_govde_fitil(mum)
+    toplam = govde + alt + ust
+    if toplam <= 0:
+        return False
+    return (govde < toplam * 0.35) and (alt > govde * 0.1) and (ust > govde * 0.1)
+
+def _ha_guclu_kirmizi(mum):
+    """Alt fitil yok/küçük, gövde baskın kırmızı mum = net düşüş mumu."""
+    if not _ha_kirmizi(mum):
+        return False
+    govde, alt, ust = _ha_govde_fitil(mum)
+    if govde <= 0:
+        return False
+    return alt < govde * 0.2
+
+def ha_skor_yeni_hesapla(ha, idx, max_geri=12):
+    """
+    "Dönüş Tazeliği" skoru (0-100). Sapan bir dönüş stratejisi olduğu için
+    'güçlü yeşil momentum' yerine 'uzun-net düşüşün ardından taze dönüş' ödüllendirilir.
+
+    A — Yeşil seri tazeliği (0-50): onay mumu kırmızı serinin ardından kaçıncı yeşil?
+        1. yeşil +50 | 2. yeşil +30 | 3. yeşil +10 | 4.+ → 0
+    B — Düşüşün olgunluğu (0-35): onay öncesi kırmızı serinin uzunluğu + netliği
+        2 gün +10 | 3-4 gün +20 | 5+ gün +25 ; seride güçlü kırmızı varsa +10
+    C — Doji köprüsü (0-15): kırmızı seri ile onay mumu arasında doji varsa +15
+        (doji seriyi kırmaz, sayılmaz da)
+
+    idx = onay mumu (giriş günü) konumu.
+    """
+    if idx < 3:
+        return None, "", False
+
+    gun = ha.iloc[idx]
+
+    # Onay mumu HA'da yeşil değilse tazelik mantığı geçersiz
+    if not _ha_yesil(gun):
+        return 0, "Onay mumu HA-yeşil değil", False
+
+    # ── Geriye doğru tek geçişli tarama ──────────────────────────────────────
+    # Her mum önce "doji mi" diye sınıflanır (doji yeşil/kırmızı da olabilir),
+    # sonra yeşil/kırmızı. Aşamalar: [onay öncesi yeşil seri] → [doji köprüsü]
+    # → [kırmızı seri]. Doji seriyi kırmaz, köprü sayılır.
+    yesil_seri    = 1          # onay mumu dahil
+    doji_gorudu   = False      # ham doji bayrağı
+    kirmizi_seri  = 0
+    kirmizi_guclu = False
+
+    asama = "yesil"            # yesil → kopru → kirmizi → done
+    j = idx - 1
+    while j >= 0 and j >= idx - max_geri:
+        mum = ha.iloc[j]
+        is_doji    = _ha_doji(mum)
+        is_kirmizi = _ha_kirmizi(mum)
+        is_yesil   = _ha_yesil(mum)
+        # Bir mum hem doji hem kırmızı olabilir → net kırmızı gövdesi varsa
+        # kırmızı seri sayılır. "Saf doji" = doji ve kırmızı değil.
+        saf_doji = is_doji and not is_kirmizi
+
+        if asama == "yesil":
+            if saf_doji:
+                doji_gorudu = True
+                asama = "kopru"
+            elif is_yesil and not is_doji:
+                yesil_seri += 1
+            elif is_kirmizi:
+                asama = "kirmizi"
+                continue       # bu mumu kırmızı aşamasında yeniden değerlendir
+            else:
+                # doji-yeşil gibi belirsiz mum — yeşil seriyi bitir, köprü aç
+                doji_gorudu = True
+                asama = "kopru"
+        elif asama == "kopru":
+            if saf_doji:
+                doji_gorudu = True
+            elif is_kirmizi:
+                asama = "kirmizi"
+                continue
+            else:
+                break          # köprüden sonra yeşil → taze düşüş yok, dur
+        elif asama == "kirmizi":
+            if is_kirmizi:
+                kirmizi_seri += 1
+                if _ha_guclu_kirmizi(mum):
+                    kirmizi_guclu = True
+            elif saf_doji:
+                doji_gorudu = True   # seri içi saf doji = köprü, seriyi kırmaz
+            else:
+                break          # yeşil mum → kırmızı seri bitti
+        j -= 1
+
+    # Doji köprüsü ancak gerçekten bir kırmızı seri varsa anlamlı
+    doji_koprusu = doji_gorudu and kirmizi_seri > 0
+
+    skor = 0
+    detay = []
+
+    # A — Yeşil seri tazeliği
+    if yesil_seri == 1:
+        skor += 50
+        detay.append("İlk yeşil (+50)")
+    elif yesil_seri == 2:
+        skor += 30
+        detay.append("2. yeşil (+30)")
+    elif yesil_seri == 3:
+        skor += 10
+        detay.append("3. yeşil (+10)")
+    else:
+        detay.append(f"{yesil_seri}. yeşil (+0)")
+
+    # B — Düşüşün olgunluğu
+    if kirmizi_seri >= 5:
+        skor += 25
+        detay.append(f"Kırmızı seri {kirmizi_seri} (+25)")
+    elif kirmizi_seri >= 3:
+        skor += 20
+        detay.append(f"Kırmızı seri {kirmizi_seri} (+20)")
+    elif kirmizi_seri == 2:
+        skor += 10
+        detay.append("Kırmızı seri 2 (+10)")
+    else:
+        detay.append(f"Kırmızı seri {kirmizi_seri} (+0)")
+
+    if kirmizi_guclu:
+        skor += 10
+        detay.append("Güçlü kırmızı (+10)")
+
+    # C — Doji köprüsü
+    if doji_koprusu:
+        skor += 15
+        detay.append("Doji köprüsü (+15)")
+
+    skor = min(skor, 100)
+    ha_sinyal_var = skor >= 55  # eski skorla aynı eşik mantığı (kıyas kolaylığı için)
+    return skor, " | ".join(detay) if detay else "—", ha_sinyal_var
+
 # ─── EMA DOKUNUŞ / HIGHER LOW — bot ile birebir aynı ────────────────────────
 def ema_dokunusu_var_mi(low_val, high_val, ema20, ema50, ema100, ema200, tolerans):
     for ema_val in [ema20, ema50, ema100, ema200]:
@@ -340,6 +491,11 @@ def sapan_sinyal_uret(df, ha, sembol, ema_tolerans, zaman_stopu, atr_kat, rr_kat
         if ha_skor is None:
             ha_skor, ha_detay, ha_sinyal_var = 0, "—", False
 
+        # YENİ HA skoru — "dönüş tazeliği" (A+B birleşimi)
+        ha_skor_y, ha_detay_y, ha_sinyal_var_y = ha_skor_yeni_hesapla(ha, i)
+        if ha_skor_y is None:
+            ha_skor_y, ha_detay_y, ha_sinyal_var_y = 0, "—", False
+
         sinyaller.append({
             "tarih"          : son.name,        # giriş günü = onay mumu günü
             "sembol"         : sembol,
@@ -352,6 +508,9 @@ def sapan_sinyal_uret(df, ha, sembol, ema_tolerans, zaman_stopu, atr_kat, rr_kat
             "ha_skor"        : int(ha_skor),
             "ha_detay"       : ha_detay,
             "ha_sinyal_var"  : bool(ha_sinyal_var),
+            "ha_skor_y"      : int(ha_skor_y),
+            "ha_detay_y"     : ha_detay_y,
+            "ha_sinyal_var_y": bool(ha_sinyal_var_y),
         })
 
     return sinyaller
@@ -430,8 +589,10 @@ st.info(f"""
 - 6 filtre `bist_sapan_telegram_bot.py` ile birebir aynı
 - Stop: Giriş − ATR(14) × {atr_kat} | Hedef: Giriş + (Giriş − Stop) × {rr_kat}
 - Zaman stopu: **{zaman_stopu} gün** | Max **{max_pozisyon}** pozisyon | Pozisyon başı **%{poz_yuzde:.0f}**
-- **HA skoru** her sinyale onay mumunun Heikin Ashi verisinden eklenir (`ha_tarayici.py` mantığı: yeşil +30, alt fitil yok +30, önceki doji +25, önceki2 kırmızı +15)
-- HA modu: **{ha_mod}**{f" — eşik: {ha_esik}" if ha_mod.startswith("Eşik") else ""}
+- **İki HA skoru** her sinyale onay mumunun Heikin Ashi verisinden eklenir:
+  - **Eski skor** (`ha_tarayici.py`): yeşil mum +30, alt fitil yok +30, önceki doji +25, önceki2 kırmızı +15
+  - **Yeni skor** (dönüş tazeliği, A+B): ilk yeşil +50 / 2. yeşil +30 / 3. yeşil +10 · kırmızı seri uzunluğu 0-25 · güçlü kırmızı +10 · doji köprüsü +15
+- HA modu: **{ha_mod}**{f" — eşik: {ha_esik}" if ha_mod.startswith("Eşik") else ""} (eşik filtresi yalnızca **eski** skora uygulanır; yeni skor şimdilik sadece etiket)
 """)
 
 # ─── BACKTEST ─────────────────────────────────────────────────────────────────
@@ -551,6 +712,9 @@ if st.button("🚀 Backtest Çalıştır", use_container_width=True, type="prima
                         "HA Skor"    : poz["ha_skor"],
                         "HA Dilim"   : ha_dilim(poz["ha_skor"]),
                         "HA Detay"   : poz["ha_detay"],
+                        "HA Skor Y"  : poz["ha_skor_y"],
+                        "HA Dilim Y" : ha_dilim(poz["ha_skor_y"]),
+                        "HA Detay Y" : poz["ha_detay_y"],
                         "Lot"        : poz["lot"],
                         "Giriş"      : round(poz["giris"], 2),
                         "Alış (TL)"  : round(poz["giris"] * poz["lot"], 0),
@@ -592,6 +756,8 @@ if st.button("🚀 Backtest Çalıştır", use_container_width=True, type="prima
                         "zaman_stopu_gun": sinyal["zaman_stopu_gun"],
                         "ha_skor"       : sinyal["ha_skor"],
                         "ha_detay"      : sinyal["ha_detay"],
+                        "ha_skor_y"     : sinyal["ha_skor_y"],
+                        "ha_detay_y"    : sinyal["ha_detay_y"],
                     })
 
         # Açık kalan pozisyonları son fiyatla kapat
@@ -614,6 +780,9 @@ if st.button("🚀 Backtest Çalıştır", use_container_width=True, type="prima
                 "HA Skor"    : poz["ha_skor"],
                 "HA Dilim"   : ha_dilim(poz["ha_skor"]),
                 "HA Detay"   : poz["ha_detay"],
+                "HA Skor Y"  : poz["ha_skor_y"],
+                "HA Dilim Y" : ha_dilim(poz["ha_skor_y"]),
+                "HA Detay Y" : poz["ha_detay_y"],
                 "Lot"        : poz["lot"],
                 "Giriş"      : round(poz["giris"], 2),
                 "Alış (TL)"  : round(poz["giris"] * poz["lot"], 0),
@@ -700,107 +869,121 @@ if "kapali" in st.session_state:
 
     st.markdown("---")
 
-    # ─── HA SKOR DİLİM ANALİZİ ────────────────────────────────────────────────
-    st.markdown("### 📡 HA Skor Dilimi Analizi")
-    st.caption("Asıl soru: HA skoru yükseldikçe win rate / profit factor artıyor mu? "
-               "Eğer 75-100 dilimi 0-25'ten belirgin iyiyse, HA skorlaması ayırt edici demektir.")
-
-    dilim_satir = []
-    for dilim in DILIM_SIRA:
-        sub = tamam[tamam["HA Dilim"] == dilim]
-        if len(sub) == 0:
-            dilim_satir.append({
-                "HA Dilim": dilim, "İşlem": 0, "Hedef": 0, "Stop": 0, "Zaman": 0,
-                "Win Rate %": 0.0, "Profit Factor": 0.0,
-                "Ort. K/Z (TL)": 0.0, "Toplam K/Z (TL)": 0.0,
+    # ─── DİLİM ANALİZİ — HER İKİ SKOR İÇİN ───────────────────────────────────
+    def dilim_tablosu(dilim_kolon):
+        satir = []
+        for dilim in DILIM_SIRA:
+            sub = tamam[tamam[dilim_kolon] == dilim]
+            if len(sub) == 0:
+                satir.append({
+                    "Dilim": dilim, "İşlem": 0, "Hedef": 0, "Stop": 0, "Zaman": 0,
+                    "Win Rate %": 0.0, "Profit Factor": 0.0,
+                    "Ort. K/Z (TL)": 0.0, "Toplam K/Z (TL)": 0.0,
+                })
+                continue
+            s_kaz = sub[sub["Sonuç"] == "✅ Hedef"]
+            s_kay = sub[sub["Sonuç"] == "❌ Stop"]
+            s_zam = sub[sub["Sonuç"] == "⏱️ Zaman"]
+            s_bk  = sub[sub["K/Z (TL)"] > 0]["K/Z (TL)"].sum()
+            s_bz  = abs(sub[sub["K/Z (TL)"] < 0]["K/Z (TL)"].sum())
+            s_pf  = s_bk / s_bz if s_bz > 0 else float("inf")
+            satir.append({
+                "Dilim"           : dilim,
+                "İşlem"           : len(sub),
+                "Hedef"           : len(s_kaz),
+                "Stop"            : len(s_kay),
+                "Zaman"           : len(s_zam),
+                "Win Rate %"      : round(len(s_kaz) / len(sub) * 100, 1),
+                "Profit Factor"   : round(s_pf, 2) if s_pf != float("inf") else 999.0,
+                "Ort. K/Z (TL)"   : round(sub["K/Z (TL)"].mean(), 0),
+                "Toplam K/Z (TL)" : round(sub["K/Z (TL)"].sum(), 0),
             })
-            continue
-        s_kaz = sub[sub["Sonuç"] == "✅ Hedef"]
-        s_kay = sub[sub["Sonuç"] == "❌ Stop"]
-        s_zam = sub[sub["Sonuç"] == "⏱️ Zaman"]
-        s_bk  = sub[sub["K/Z (TL)"] > 0]["K/Z (TL)"].sum()
-        s_bz  = abs(sub[sub["K/Z (TL)"] < 0]["K/Z (TL)"].sum())
-        s_pf  = s_bk / s_bz if s_bz > 0 else float("inf")
-        dilim_satir.append({
-            "HA Dilim"        : dilim,
-            "İşlem"           : len(sub),
-            "Hedef"           : len(s_kaz),
-            "Stop"            : len(s_kay),
-            "Zaman"           : len(s_zam),
-            "Win Rate %"      : round(len(s_kaz) / len(sub) * 100, 1),
-            "Profit Factor"   : round(s_pf, 2) if s_pf != float("inf") else 999.0,
-            "Ort. K/Z (TL)"   : round(sub["K/Z (TL)"].mean(), 0),
-            "Toplam K/Z (TL)" : round(sub["K/Z (TL)"].sum(), 0),
-        })
-    df_dilim = pd.DataFrame(dilim_satir)
+        return pd.DataFrame(satir)
 
-    cda, cdb = st.columns([1, 1])
-    with cda:
-        st.dataframe(
-            df_dilim.style.format({
-                "Win Rate %": "{:.1f}",
-                "Profit Factor": lambda x: "∞" if x >= 999 else f"{x:.2f}",
-                "Ort. K/Z (TL)": "{:+,.0f}",
-                "Toplam K/Z (TL)": "{:+,.0f}",
-            }),
-            use_container_width=True, hide_index=True
-        )
-    with cdb:
-        fig_d = go.Figure()
-        fig_d.add_trace(go.Bar(
-            x=df_dilim["HA Dilim"], y=df_dilim["Win Rate %"],
-            marker_color=["#ef4444","#f59e0b","#3b82f6","#22c55e"],
-            text=[f"{v:.1f}%" for v in df_dilim["Win Rate %"]],
-            textposition="outside", name="Win Rate %",
-        ))
-        fig_d.add_hline(y=win_rate, line_dash="dash", line_color="#94a3b8",
-                        annotation_text=f"Genel: {win_rate:.1f}%")
-        fig_d.update_layout(
-            template="plotly_dark", paper_bgcolor="#0d0f14", plot_bgcolor="#0d0f14",
-            height=300, margin=dict(l=10,r=10,t=20,b=10),
-            yaxis=dict(gridcolor="#1e293b", ticksuffix="%"),
-            xaxis=dict(gridcolor="#1e293b", title="HA Skor Dilimi"),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_d, use_container_width=True)
+    def dilim_goster(df_d, baslik):
+        st.markdown(f"**{baslik}**")
+        cda, cdb = st.columns([1, 1])
+        with cda:
+            st.dataframe(
+                df_d.style.format({
+                    "Win Rate %": "{:.1f}",
+                    "Profit Factor": lambda x: "∞" if x >= 999 else f"{x:.2f}",
+                    "Ort. K/Z (TL)": "{:+,.0f}",
+                    "Toplam K/Z (TL)": "{:+,.0f}",
+                }),
+                use_container_width=True, hide_index=True
+            )
+        with cdb:
+            fig_d = go.Figure()
+            fig_d.add_trace(go.Bar(
+                x=df_d["Dilim"], y=df_d["Win Rate %"],
+                marker_color=["#ef4444","#f59e0b","#3b82f6","#22c55e"],
+                text=[f"{v:.1f}%" for v in df_d["Win Rate %"]],
+                textposition="outside", name="Win Rate %",
+            ))
+            fig_d.add_hline(y=win_rate, line_dash="dash", line_color="#94a3b8",
+                            annotation_text=f"Genel: {win_rate:.1f}%")
+            fig_d.update_layout(
+                template="plotly_dark", paper_bgcolor="#0d0f14", plot_bgcolor="#0d0f14",
+                height=280, margin=dict(l=10,r=10,t=20,b=10),
+                yaxis=dict(gridcolor="#1e293b", ticksuffix="%"),
+                xaxis=dict(gridcolor="#1e293b", title="Skor Dilimi"),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_d, use_container_width=True)
+        az = df_d[(df_d["İşlem"] > 0) & (df_d["İşlem"] < 10)]
+        if len(az) > 0:
+            st.warning(f"⚠️ {', '.join(az['Dilim'])} diliminde işlem sayısı 10'un altında — "
+                       f"istatistik güvenilirliği düşük.")
 
-    # İşlem sayısı az olan dilimler için uyarı
-    az_dilim = df_dilim[(df_dilim["İşlem"] > 0) & (df_dilim["İşlem"] < 10)]
-    if len(az_dilim) > 0:
-        st.warning(f"⚠️ Şu dilimlerde işlem sayısı 10'un altında, istatistik güvenilirliği düşük: "
-                   f"{', '.join(az_dilim['HA Dilim'])}. Sonuçları temkinli yorumla.")
+    st.markdown("### 📡 HA Skor Dilimi Analizi — Eski vs Yeni")
+    st.caption("Asıl soru: hangi skor, yükseldikçe win rate / profit factor'ü artırıyor? "
+               "Yeni 'dönüş tazeliği' skoru eskisinden daha net bir kademelenme gösteriyorsa, "
+               "doğru yolda demektir.")
 
-    # ─── HAM EŞİK KARŞILAŞTIRMASI (55) ────────────────────────────────────────
-    st.markdown("### 🎯 HA 55 Eşiği — Var / Yok Karşılaştırması")
-    st.caption("`ha_tarayici.py`'nin 'sinyal var' saydığı 55 eşiğine göre ikili kıyas. "
-               "Bu mod 'Sadece etiketle' iken anlamlı — tüm sinyaller alınmış olur, "
-               "HA sinyali olan ve olmayan grupların performansı karşılaştırılır.")
+    df_dilim_eski = dilim_tablosu("HA Dilim")
+    df_dilim_yeni = dilim_tablosu("HA Dilim Y")
 
-    esik_satir = []
-    for ad, mask in [
-        ("HA Sinyali VAR (skor ≥ 55)", tamam["HA Skor"] >= 55),
-        ("HA Sinyali YOK (skor < 55)", tamam["HA Skor"] < 55),
-    ]:
-        sub = tamam[mask]
-        if len(sub) == 0:
-            esik_satir.append({
-                "Grup": ad, "İşlem": 0, "Win Rate %": 0.0,
-                "Profit Factor": 0.0, "Ort. K/Z (TL)": 0.0, "Toplam K/Z (TL)": 0.0,
+    dilim_goster(df_dilim_eski, "🔵 ESKİ SKOR (ha_tarayici.py — yeşil momentum)")
+    st.markdown("")
+    dilim_goster(df_dilim_yeni, "🟢 YENİ SKOR (dönüş tazeliği — A+B birleşimi)")
+
+    # ─── EŞİK KARŞILAŞTIRMASI (55) — HER İKİ SKOR ────────────────────────────
+    st.markdown("### 🎯 55 Eşiği — Var / Yok Karşılaştırması (Eski vs Yeni)")
+    st.caption("Her iki skorun 55 eşiğine göre ikili kıyası. 'Sadece etiketle' modunda "
+               "tüm sinyaller alınır; bu tablo eşik filtresi konsaydı ne olurdu sorusunu yanıtlar.")
+
+    def esik_tablosu(skor_kolon, etiket):
+        satir = []
+        for ad, mask in [
+            (f"{etiket}: VAR (≥55)", tamam[skor_kolon] >= 55),
+            (f"{etiket}: YOK (<55)", tamam[skor_kolon] < 55),
+        ]:
+            sub = tamam[mask]
+            if len(sub) == 0:
+                satir.append({
+                    "Grup": ad, "İşlem": 0, "Win Rate %": 0.0,
+                    "Profit Factor": 0.0, "Ort. K/Z (TL)": 0.0, "Toplam K/Z (TL)": 0.0,
+                })
+                continue
+            s_kaz = sub[sub["Sonuç"] == "✅ Hedef"]
+            s_bk  = sub[sub["K/Z (TL)"] > 0]["K/Z (TL)"].sum()
+            s_bz  = abs(sub[sub["K/Z (TL)"] < 0]["K/Z (TL)"].sum())
+            s_pf  = s_bk / s_bz if s_bz > 0 else float("inf")
+            satir.append({
+                "Grup"            : ad,
+                "İşlem"           : len(sub),
+                "Win Rate %"      : round(len(s_kaz) / len(sub) * 100, 1),
+                "Profit Factor"   : round(s_pf, 2) if s_pf != float("inf") else 999.0,
+                "Ort. K/Z (TL)"   : round(sub["K/Z (TL)"].mean(), 0),
+                "Toplam K/Z (TL)" : round(sub["K/Z (TL)"].sum(), 0),
             })
-            continue
-        s_kaz = sub[sub["Sonuç"] == "✅ Hedef"]
-        s_bk  = sub[sub["K/Z (TL)"] > 0]["K/Z (TL)"].sum()
-        s_bz  = abs(sub[sub["K/Z (TL)"] < 0]["K/Z (TL)"].sum())
-        s_pf  = s_bk / s_bz if s_bz > 0 else float("inf")
-        esik_satir.append({
-            "Grup"            : ad,
-            "İşlem"           : len(sub),
-            "Win Rate %"      : round(len(s_kaz) / len(sub) * 100, 1),
-            "Profit Factor"   : round(s_pf, 2) if s_pf != float("inf") else 999.0,
-            "Ort. K/Z (TL)"   : round(sub["K/Z (TL)"].mean(), 0),
-            "Toplam K/Z (TL)" : round(sub["K/Z (TL)"].sum(), 0),
-        })
-    df_esik = pd.DataFrame(esik_satir)
+        return pd.DataFrame(satir)
+
+    df_esik = pd.concat([
+        esik_tablosu("HA Skor", "Eski"),
+        esik_tablosu("HA Skor Y", "Yeni"),
+    ], ignore_index=True)
     st.dataframe(
         df_esik.style.format({
             "Win Rate %": "{:.1f}",
@@ -890,7 +1073,9 @@ if "kapali" in st.session_state:
         df_g["K/Z (TL)"] = df_g["K/Z (TL)"].apply(lambda x: f"{x:+,.0f}")
         st.dataframe(
             df_g[[
-                "Açılış","Kapanış","Gün","Hisse","★","HA Skor","HA Dilim","HA Detay",
+                "Açılış","Kapanış","Gün","Hisse","★",
+                "HA Skor","HA Dilim","HA Detay",
+                "HA Skor Y","HA Dilim Y","HA Detay Y",
                 "Lot","Giriş","Alış (TL)","Stop","Hedef","Çıkış","Satış (TL)",
                 "Sonuç","K/Z (TL)","Portföy"
             ]],
